@@ -51,6 +51,10 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@61cb8a9741eeb8a550a1b8544337180c0fc8476b
 
+      - name: Clone private repositories
+        run: |
+          git clone https://github.com/enitrat/skill-issue.git /tmp/skill-issue
+
       - name: Build custom system prompt
         id: custom_prompt
         run: |
@@ -145,6 +149,10 @@ jobs:
         uses: anthropics/claude-code-action@a017b830c03e23789b11fb69ed571ea61c12e45c # 2026-01-16
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: "/tmp/skill-issue"
+          plugins: |
+            personal-skills@eni-skills
+          # Prompt: empty string for comments (action extracts text after @claude)
           prompt: ""
           claude_args: |
             --model opus
