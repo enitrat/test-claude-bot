@@ -53,7 +53,9 @@ jobs:
 
       - name: Clone private repositories
         run: |
-          git clone https://github.com/enitrat/skill-issue.git /tmp/skill-issue
+          gh repo clone enitrat/skill-issue /tmp/skill-issue
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_ACCESS_TOKEN }}
 
       - name: Build custom system prompt
         id: custom_prompt
