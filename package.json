@@ -1,8 +1,0 @@
-{
-  "name": "test-claude-bot",
-  "version": "1.0.0",
-  "description": "Test project for Claude bot with Python API bug",
-  "scripts": {
-    "test-api": "curl http://localhost:8000/"
-  }
-}
