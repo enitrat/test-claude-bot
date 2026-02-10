@@ -148,7 +148,7 @@ jobs:
           ISSUE_STATE_INPUT: ${{ github.event.issue.state }}
 
       - name: Run Claude Code
-        uses: anthropics/claude-code-action@a017b830c03e23789b11fb69ed571ea61c12e45c # 2026-01-16
+        uses: anthropics/claude-code-action@b433f16b30d54063fd3bab6b12f46f3da00e41b6 # 2026-01-16
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: "/tmp/skill-issue"
