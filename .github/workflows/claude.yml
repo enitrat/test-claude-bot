@@ -151,7 +151,27 @@ jobs:
           ISSUE_AUTHOR_INPUT: ${{ github.event.issue.user.login }}
           ISSUE_STATE_INPUT: ${{ github.event.issue.state }}
 
-      # --- Phase 2: Network sandbox (lock down before running Claude) ---
+      # --- Phase 2: Pre-install deps (full network, before lockdown) ---
+      # Node.js native fetch (undici) does NOT respect HTTP_PROXY env vars.
+      # setup-bun uses Node.js fetch internally → must install before iptables.
+      # Claude Code native binary has a known proxy bug (#14165) → use npm install.
+
+      - name: Install Bun
+        id: setup-bun
+        uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3
+        with:
+          bun-version: 1.3.6
+
+      - name: Install Claude Code (npm, not native binary)
+        id: setup-claude
+        run: |
+          # The native binary (install.sh) ignores HTTP_PROXY for API streaming.
+          # npm install produces a Node.js-based CLI that respects proxy env vars.
+          # See: https://github.com/anthropics/claude-code/issues/14165
+          npm install -g @anthropic-ai/claude-code@2.1.42
+          echo "path=$(which claude)" >> "$GITHUB_OUTPUT"
+
+      # --- Phase 3: Network sandbox (lock down before running Claude) ---
 
       - name: Start Squid proxy for network sandbox
         run: |
@@ -235,7 +255,7 @@ jobs:
 
           echo "::endgroup::"
 
-      # --- Phase 3: Run Claude Code (sandboxed) ---
+      # --- Phase 4: Run Claude Code (sandboxed) ---
 
       - name: Run Claude Code
         uses: anthropics/claude-code-action@b433f16b30d54063fd3bab6b12f46f3da00e41b6 # 2026-02-10
@@ -246,6 +266,9 @@ jobs:
           NO_PROXY: localhost,127.0.0.1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Pre-installed in Phase 2 to avoid Node.js fetch proxy issues
+          path_to_bun_executable: ${{ steps.setup-bun.outputs.bun-path }}/bun
+          path_to_claude_code_executable: ${{ steps.setup-claude.outputs.path }}
           plugin_marketplaces: "/tmp/skill-issue"
           plugins: |
             personal-skills@eni-skills
