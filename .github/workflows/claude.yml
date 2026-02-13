@@ -167,9 +167,11 @@ jobs:
             ubuntu/squid
 
           # Wait for Squid to be ready (up to 60s)
+          # Use api.github.com (returns 200 without auth) instead of api.anthropic.com
+          # (returns 401 without API key, which causes curl -f to fail).
           echo "Waiting for Squid proxy to become ready..."
           for i in $(seq 1 30); do
-            if curl -sf -x http://localhost:3128 -o /dev/null https://api.anthropic.com 2>/dev/null; then
+            if curl -sf -x http://localhost:3128 -o /dev/null https://api.github.com 2>/dev/null; then
               echo "Squid proxy is ready (attempt $i)"
               break
             fi
@@ -185,16 +187,22 @@ jobs:
 
           # Verify: allowed domain works, blocked domain is rejected
           echo "::group::Verifying proxy allowlist"
-          echo "Testing allowed domain (api.anthropic.com)..."
-          curl -sf -x http://localhost:3128 -o /dev/null -w "  status: %{http_code}\n" https://api.anthropic.com || true
+          echo "Testing allowed domain (api.github.com)..."
+          HTTP_CODE=$(curl -s -x http://localhost:3128 -o /dev/null -w '%{http_code}' https://api.github.com)
+          echo "  status: $HTTP_CODE"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Allowed domain api.github.com returned $HTTP_CODE"
+            exit 1
+          fi
 
           echo "Testing blocked domain (google.com)..."
-          if curl -sf -x http://localhost:3128 -o /dev/null https://google.com 2>/dev/null; then
-            echo "::error::Blocked domain google.com was reachable through proxy!"
+          HTTP_CODE=$(curl -s -x http://localhost:3128 -o /dev/null -w '%{http_code}' https://google.com)
+          echo "  status: $HTTP_CODE"
+          if [ "$HTTP_CODE" -ne 403 ] && [ "$HTTP_CODE" -ne 0 ]; then
+            echo "::error::Blocked domain google.com was not rejected (got $HTTP_CODE)"
             exit 1
-          else
-            echo "  Correctly blocked (expected)"
           fi
+          echo "  Correctly blocked (expected)"
           echo "::endgroup::"
 
       - name: Enforce proxy-only egress (iptables)
