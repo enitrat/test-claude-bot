@@ -14,10 +14,12 @@ name: claude-review
 #
 # Secrets required:
 # - CLAUDE_CODE_OAUTH_TOKEN: OAuth token from `claude setup-token`
-# - CLAUDE_ACCESS_TOKEN: PAT with 'repo' scope for private repos (zama-marketplace, tech-specs)
+# - CLAUDE_ACCESS_TOKEN: PAT with 'repo' scope for private repos
 #
-# Note: Private marketplaces are cloned in a separate step using a dedicated PAT,
-# then passed as a local path to avoid git auth issues in the action's setup.
+# Network sandbox:
+# Claude Code runs behind a Squid proxy that only allows whitelisted domains.
+# iptables rules enforce proxy-only egress (defense-in-depth against proxy bypass).
+# See: https://github.com/zama-ai/security-hub/tree/main/docs/how-tos/sandboxed-claude-code
 
 on:
   issue_comment:
@@ -43,6 +45,8 @@ jobs:
       id-token: write # Required for OIDC authentication
       actions: read # Required for reading CI results
     steps:
+      # --- Phase 1: Setup (full network access) ---
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
@@ -147,8 +151,93 @@ jobs:
           ISSUE_AUTHOR_INPUT: ${{ github.event.issue.user.login }}
           ISSUE_STATE_INPUT: ${{ github.event.issue.state }}
 
+      # --- Phase 2: Network sandbox (lock down before running Claude) ---
+
+      - name: Start Squid proxy for network sandbox
+        run: |
+          echo "::group::Starting Squid proxy with domain allowlist"
+
+          # Start Squid proxy container with the allowlist config.
+          # Port 3128 is exposed on localhost so the runner can reach it.
+          # The proxy enforces domain-level allowlisting (Layer 7).
+          docker run -d \
+            --name sandbox-proxy \
+            -p 3128:3128 \
+            -v "${{ github.workspace }}/.github/squid/sandbox-proxy-rules.conf:/etc/squid/conf.d/00-sandbox-proxy-rules.conf:ro" \
+            ubuntu/squid
+
+          # Wait for Squid to be ready (up to 60s)
+          echo "Waiting for Squid proxy to become ready..."
+          for i in $(seq 1 30); do
+            if curl -sf -x http://localhost:3128 -o /dev/null https://api.anthropic.com 2>/dev/null; then
+              echo "Squid proxy is ready (attempt $i)"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::Squid proxy failed to start within 60s"
+              docker logs sandbox-proxy
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "::endgroup::"
+
+          # Verify: allowed domain works, blocked domain is rejected
+          echo "::group::Verifying proxy allowlist"
+          echo "Testing allowed domain (api.anthropic.com)..."
+          curl -sf -x http://localhost:3128 -o /dev/null -w "  status: %{http_code}\n" https://api.anthropic.com || true
+
+          echo "Testing blocked domain (google.com)..."
+          if curl -sf -x http://localhost:3128 -o /dev/null https://google.com 2>/dev/null; then
+            echo "::error::Blocked domain google.com was reachable through proxy!"
+            exit 1
+          else
+            echo "  Correctly blocked (expected)"
+          fi
+          echo "::endgroup::"
+
+      - name: Enforce proxy-only egress (iptables)
+        run: |
+          echo "::group::Applying iptables rules for network sandbox"
+
+          # Defense-in-depth: even if proxy env vars are unset, direct outbound
+          # TCP connections from the runner are blocked. Only the proxy (on
+          # localhost:3128) can make outbound connections (via Docker FORWARD chain).
+          #
+          # ESTABLISHED,RELATED keeps the runner's existing connection to
+          # GitHub Actions alive. If this connection drops, the job will fail
+          # closed (no network) rather than fail open (unrestricted).
+          #
+          # DNS (UDP 53) is allowed because the Docker daemon needs it to
+          # resolve domains for the Squid proxy container's outbound requests.
+
+          # 1. Allow already-established connections (keeps GH Actions runner alive)
+          sudo iptables -I OUTPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+          # 2. Allow loopback (runner ↔ proxy at localhost:3128)
+          sudo iptables -I OUTPUT 2 -o lo -j ACCEPT
+
+          # 3. Allow DNS (needed for Docker/proxy domain resolution)
+          sudo iptables -I OUTPUT 3 -p udp --dport 53 -j ACCEPT
+
+          # 4. Block all new outbound TCP (forces HTTP/HTTPS through proxy)
+          sudo iptables -A OUTPUT -p tcp --syn -j REJECT --reject-with tcp-reset
+
+          echo "Active OUTPUT rules:"
+          sudo iptables -S OUTPUT
+
+          echo "::endgroup::"
+
+      # --- Phase 3: Run Claude Code (sandboxed) ---
+
       - name: Run Claude Code
-        uses: anthropics/claude-code-action@b433f16b30d54063fd3bab6b12f46f3da00e41b6 # 2026-01-16
+        uses: anthropics/claude-code-action@b433f16b30d54063fd3bab6b12f46f3da00e41b6 # 2026-02-10
+        env:
+          # Force all HTTP(S) traffic through the Squid proxy
+          HTTP_PROXY: http://localhost:3128
+          HTTPS_PROXY: http://localhost:3128
+          NO_PROXY: localhost,127.0.0.1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: "/tmp/skill-issue"
@@ -159,5 +248,5 @@ jobs:
           prompt: ""
           claude_args: |
             --model opus
-            --allowedTools "Bash(uv:*),Bash(gh:*),Bash(git:*),Read,Edit,Write,Glob,Grep,Task"
+            --dangerously-skip-permissions
             --system-prompt "${{ env.CUSTOM_SYSTEM_PROMPT }}"
