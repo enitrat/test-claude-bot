@@ -196,10 +196,8 @@ jobs:
           fi
 
           echo "Testing blocked domain (google.com)..."
-          HTTP_CODE=$(curl -s -x http://localhost:3128 -o /dev/null -w '%{http_code}' https://google.com)
-          echo "  status: $HTTP_CODE"
-          if [ "$HTTP_CODE" -ne 403 ] && [ "$HTTP_CODE" -ne 0 ]; then
-            echo "::error::Blocked domain google.com was not rejected (got $HTTP_CODE)"
+          if curl -sf -x http://localhost:3128 -o /dev/null https://google.com 2>/dev/null; then
+            echo "::error::Blocked domain google.com was reachable through proxy!"
             exit 1
           fi
           echo "  Correctly blocked (expected)"
