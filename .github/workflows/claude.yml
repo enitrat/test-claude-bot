@@ -151,44 +151,76 @@ jobs:
           ISSUE_AUTHOR_INPUT: ${{ github.event.issue.user.login }}
           ISSUE_STATE_INPUT: ${{ github.event.issue.state }}
 
-      # --- Phase 2: Pre-install deps (full network, before lockdown) ---
-      # Everything that needs unrestricted network must be installed here.
-      # After this phase, iptables blocks all direct outbound TCP.
-      #
-      # Why each pre-install is needed:
-      # - Bun: setup-bun uses Node.js fetch internally (ignores HTTP_PROXY)
-      # - Action deps: bun install has known proxy issues (ConnectionClosed)
-      # - Claude Code: native binary ignores HTTP_PROXY (#14165), npm install works
+      # --- Phase 2: Pre-exchange OIDC token (before network lockdown) ---
+      # The action normally does OIDC → Anthropic exchange → GitHub App token internally,
+      # but that uses fetch() which doesn't respect HTTP_PROXY and gets blocked by iptables.
+      # By doing it here with curl (proxy-unaware, pre-lockdown), we get the token early
+      # and pass it via `github_token` input to skip the action's internal OIDC flow.
+
+      - name: Exchange OIDC for GitHub App token
+        id: oidc-exchange
+        run: |
+          echo "::group::OIDC token exchange"
+
+          # Step 1: Get OIDC JWT from GitHub Actions
+          echo "Requesting OIDC token from GitHub..."
+          OIDC_RESPONSE=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=claude-code-github-action")
+          OIDC_TOKEN=$(echo "$OIDC_RESPONSE" | jq -r '.value')
+
+          if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+            echo "::error::Failed to get OIDC token from GitHub"
+            echo "Response: $OIDC_RESPONSE"
+            exit 1
+          fi
+          echo "Got OIDC token"
+
+          # Step 2: Exchange OIDC token for GitHub App installation token via Anthropic
+          echo "Exchanging OIDC token for GitHub App token..."
+          EXCHANGE_RESPONSE=$(curl -sf -X POST \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"permissions":{"contents":"write","pull_requests":"write","issues":"write"}}' \
+            "https://api.anthropic.com/api/github/github-app-token-exchange")
+          APP_TOKEN=$(echo "$EXCHANGE_RESPONSE" | jq -r '.token')
+
+          if [ -z "$APP_TOKEN" ] || [ "$APP_TOKEN" = "null" ]; then
+            echo "::error::Failed to exchange OIDC token for GitHub App token"
+            echo "Response: $EXCHANGE_RESPONSE"
+            exit 1
+          fi
+
+          echo "::add-mask::$APP_TOKEN"
+          echo "app_token=$APP_TOKEN" >> "$GITHUB_OUTPUT"
+          echo "Got GitHub App token"
+          echo "::endgroup::"
+
+      # --- Phase 3: Pre-install all dependencies (before network lockdown) ---
+      # The action internally runs setup-bun + bun install + claude install.
+      # These use fetch()/HTTP clients that don't respect proxies and would be
+      # blocked by iptables. Pre-install everything here, then pass paths to skip them.
 
       - name: Install Bun
         uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3
         with:
-          bun-version: 1.3.6
+          bun-version: latest
 
-      - name: Pre-install all dependencies
-        id: preinstall
+      - name: Pre-install action dependencies
+        id: setup-deps
         run: |
-          # Save bun path for later
-          echo "bun-path=$(which bun)" >> "$GITHUB_OUTPUT"
-
-          # Install Claude Code via npm (not native binary).
-          # Native binary ignores HTTP_PROXY for API streaming.
-          # See: https://github.com/anthropics/claude-code/issues/14165
-          npm install -g @anthropic-ai/claude-code@2.1.42
-          echo "claude-path=$(which claude)" >> "$GITHUB_OUTPUT"
-
-          # Pre-install the composite action's npm dependencies.
-          # GitHub Actions downloads actions during "Set up job", so the
-          # directory exists before any steps run.
           ACTION_DIR="/home/runner/work/_actions/anthropics/claude-code-action/b433f16b30d54063fd3bab6b12f46f3da00e41b6"
-          if [ -d "$ACTION_DIR" ]; then
-            echo "Pre-installing action deps in $ACTION_DIR"
-            cd "$ACTION_DIR" && bun install --production
-          else
-            echo "::warning::Action directory not found at $ACTION_DIR"
-          fi
+          echo "Installing action dependencies in $ACTION_DIR..."
+          cd "$ACTION_DIR" && bun install --production
+          echo "bun_path=$(which bun)" >> "$GITHUB_OUTPUT"
 
-      # --- Phase 3: Network sandbox (lock down before running Claude) ---
+      - name: Install Claude Code (npm)
+        id: setup-claude
+        run: |
+          npm install -g @anthropic-ai/claude-code@2.1.42
+          echo "path=$(which claude)" >> "$GITHUB_OUTPUT"
+
+      # --- Phase 4: Network sandbox (lock down before running Claude) ---
 
       - name: Start Squid proxy for network sandbox
         run: |
@@ -240,41 +272,52 @@ jobs:
           echo "  Correctly blocked (expected)"
           echo "::endgroup::"
 
-      - name: Enforce proxy-only egress (iptables)
+      - name: Lock down iptables (defense-in-depth)
         run: |
-          echo "::group::Applying iptables rules for network sandbox"
+          echo "::group::Configuring iptables to force proxy-only egress"
 
-          # Defense-in-depth: even if proxy env vars are unset, direct outbound
-          # TCP connections from the runner are blocked. Only the proxy (on
-          # localhost:3128) can make outbound connections (via Docker FORWARD chain).
-          #
-          # ESTABLISHED,RELATED keeps the runner's existing connection to
-          # GitHub Actions alive. If this connection drops, the job will fail
-          # closed (no network) rather than fail open (unrestricted).
-          #
-          # DNS (UDP 53) is allowed because the Docker daemon needs it to
-          # resolve domains for the Squid proxy container's outbound requests.
+          # Get the runner's UID to scope rules (only block the runner user)
+          RUNNER_UID=$(id -u)
+          echo "Runner UID: $RUNNER_UID"
 
-          # 1. Allow already-established connections (keeps GH Actions runner alive)
-          sudo iptables -I OUTPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+          # Allow established connections (don't break in-flight traffic)
+          sudo iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-          # 2. Allow loopback (runner ↔ proxy at localhost:3128)
-          sudo iptables -I OUTPUT 2 -o lo -j ACCEPT
+          # Allow loopback (localhost proxy, Docker socket, etc.)
+          sudo iptables -A OUTPUT -o lo -j ACCEPT
 
-          # 3. Allow DNS (needed for Docker/proxy domain resolution)
-          sudo iptables -I OUTPUT 3 -p udp --dport 53 -j ACCEPT
+          # Allow traffic to Docker bridge (Squid proxy container)
+          sudo iptables -A OUTPUT -d 172.16.0.0/12 -j ACCEPT
 
-          # 4. Block all new outbound TCP (forces HTTP/HTTPS through proxy)
-          sudo iptables -A OUTPUT -p tcp --syn -j REJECT --reject-with tcp-reset
+          # Block NEW outbound TCP from the runner user (force proxy use)
+          # This only affects the runner UID — system services are unaffected.
+          sudo iptables -A OUTPUT -m owner --uid-owner "$RUNNER_UID" \
+            -p tcp --syn -j REJECT --reject-with tcp-reset
 
-          echo "Active OUTPUT rules:"
-          sudo iptables -S OUTPUT
+          echo "iptables rules applied for UID $RUNNER_UID"
+
+          # Verify: direct connection is blocked
+          echo "Verifying direct connection is blocked..."
+          if curl -sf --max-time 5 -o /dev/null https://google.com 2>/dev/null; then
+            echo "::error::Direct connection to google.com succeeded (should be blocked)!"
+            exit 1
+          fi
+          echo "  Direct connection correctly blocked"
+
+          # Verify: proxy connection still works
+          echo "Verifying proxy connection still works..."
+          if ! curl -sf --max-time 10 -x http://localhost:3128 -o /dev/null https://api.github.com 2>/dev/null; then
+            echo "::error::Proxy connection to api.github.com failed!"
+            exit 1
+          fi
+          echo "  Proxy connection works"
 
           echo "::endgroup::"
 
-      # --- Phase 4: Run Claude Code (sandboxed) ---
+      # --- Phase 5: Run Claude Code (sandboxed) ---
 
       - name: Run Claude Code
+        id: run-claude
         uses: anthropics/claude-code-action@b433f16b30d54063fd3bab6b12f46f3da00e41b6 # 2026-02-10
         env:
           # Force all HTTP(S) traffic through the Squid proxy
@@ -283,9 +326,11 @@ jobs:
           NO_PROXY: localhost,127.0.0.1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Pre-installed in Phase 2 to avoid Node.js fetch proxy issues
-          path_to_bun_executable: ${{ steps.preinstall.outputs.bun-path }}
-          path_to_claude_code_executable: ${{ steps.preinstall.outputs.claude-path }}
+          # Pre-exchanged GitHub App token (skips action's internal OIDC flow)
+          github_token: ${{ steps.oidc-exchange.outputs.app_token }}
+          # Pre-installed Bun and Claude Code (skips action's internal installs)
+          path_to_bun_executable: ${{ steps.setup-deps.outputs.bun_path }}
+          path_to_claude_code_executable: ${{ steps.setup-claude.outputs.path }}
           plugin_marketplaces: "/tmp/skill-issue"
           plugins: |
             personal-skills@eni-skills
@@ -296,3 +341,14 @@ jobs:
             --model opus
             --dangerously-skip-permissions
             --system-prompt "${{ env.CUSTOM_SYSTEM_PROMPT }}"
+
+      # Revoke the GitHub App token after use (the action skips this when github_token is provided)
+      - name: Revoke GitHub App token
+        if: always() && steps.oidc-exchange.outputs.app_token != ''
+        run: |
+          curl -sf -X DELETE \
+            -H "Authorization: Bearer $APP_TOKEN" \
+            "${GITHUB_API_URL:-https://api.github.com}/installation/token" \
+            || echo "Token revocation failed (may already be expired)"
+        env:
+          APP_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
