@@ -61,10 +61,14 @@ jobs:
         run: |
           if [[ "$EVENT_NAME" == "pull_request" ]] || [[ -n "$ISSUE_PR_URL" ]]; then
             if [[ "$EVENT_NAME" == "pull_request" ]]; then
-              PR_TITLE="$PR_TITLE_INPUT"; PR_AUTHOR="$PR_AUTHOR_INPUT"
-              PR_HEAD="$PR_HEAD_INPUT"; PR_BASE="$PR_BASE_INPUT"
-              PR_STATE="$PR_STATE_INPUT"; PR_ADDITIONS="$PR_ADDITIONS_INPUT"
-              PR_DELETIONS="$PR_DELETIONS_INPUT"; PR_COMMITS="$PR_COMMITS_INPUT"
+              PR_TITLE="$PR_TITLE_INPUT"
+              PR_AUTHOR="$PR_AUTHOR_INPUT"
+              PR_HEAD="$PR_HEAD_INPUT"
+              PR_BASE="$PR_BASE_INPUT"
+              PR_STATE="$PR_STATE_INPUT"
+              PR_ADDITIONS="$PR_ADDITIONS_INPUT"
+              PR_DELETIONS="$PR_DELETIONS_INPUT"
+              PR_COMMITS="$PR_COMMITS_INPUT"
               PR_FILES="$PR_FILES_INPUT"
             else
               PR_NUMBER="$ISSUE_NUMBER_INPUT"
@@ -185,8 +189,12 @@ jobs:
 
           # Verify: allowed domain works, blocked domain is rejected
           HTTP_CODE=$(curl -s -x http://localhost:3128 -o /dev/null -w '%{http_code}' https://api.github.com)
-          [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 400 ] || { echo "::error::Allowed domain returned $HTTP_CODE"; exit 1; }
-          curl -sf -x http://localhost:3128 -o /dev/null https://google.com 2>/dev/null && { echo "::error::Blocked domain reachable!"; exit 1; }
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Allowed domain returned $HTTP_CODE"; exit 1
+          fi
+          if curl -sf -x http://localhost:3128 -o /dev/null https://google.com 2>/dev/null; then
+            echo "::error::Blocked domain reachable!"; exit 1
+          fi
 
       - name: Lock down iptables
         run: |
@@ -201,8 +209,12 @@ jobs:
           sudo iptables -A OUTPUT -m owner --uid-owner "$RUNNER_UID" -p tcp --syn -j REJECT --reject-with tcp-reset
 
           # Verify: direct blocked, proxy works
-          curl -sf --max-time 5 -o /dev/null https://google.com 2>/dev/null && { echo "::error::Direct connection not blocked!"; exit 1; }
-          curl -sf --max-time 10 -x http://localhost:3128 -o /dev/null https://api.github.com 2>/dev/null || { echo "::error::Proxy broken!"; exit 1; }
+          if curl -sf --max-time 5 -o /dev/null https://google.com 2>/dev/null; then
+            echo "::error::Direct connection not blocked!"; exit 1
+          fi
+          if ! curl -sf --max-time 10 -x http://localhost:3128 -o /dev/null https://api.github.com 2>/dev/null; then
+            echo "::error::Proxy broken!"; exit 1
+          fi
 
       # ── Phase 4: Run Claude Code (sandboxed) ───────────────────────────
 
