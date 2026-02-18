@@ -1,16 +1,12 @@
 name: claude-review
 
 # Triggered by @claude mention in PR comments.
-# The action extracts text after "@claude" as the prompt.
+# The prompt is extracted as the text after "@claude" in the comment body.
 #
 # Security model:
-#   - Only write/admin users can trigger (enforced by the action)
+#   - Only write/admin users can trigger (enforced by permission check on the App token)
 #   - Network sandbox: Squid proxy (L7 domain allowlist) + iptables (L3 egress block)
-#   - All dependencies pre-installed before lockdown; action skips its internal installs
-#
-# Why pre-install? The action internally runs setup-bun, bun install, and claude install.
-# These use fetch() which ignores HTTP_PROXY and gets blocked by iptables.
-# We do them beforehand and pass paths via inputs to skip those steps.
+#   - All dependencies pre-installed before lockdown
 #
 # Secrets:
 #   - CLAUDE_CODE_OAUTH_TOKEN: Anthropic API auth (from `claude setup-token`)
@@ -125,11 +121,8 @@ jobs:
           ISSUE_STATE_INPUT: ${{ github.event.issue.state }}
 
       # ── Phase 2: Pre-install dependencies (before lockdown) ────────────
-      # The action's internal setup-bun, bun install, and claude install all
-      # use fetch() which ignores HTTP_PROXY → blocked by iptables.
-      # Pre-installing and passing paths via inputs skips those steps entirely.
 
-      # OIDC → Anthropic exchange → GitHub App token (normally done inside the action)
+      # OIDC → Anthropic exchange → GitHub App token
       - name: Exchange OIDC for GitHub App token
         id: oidc-exchange
         run: |
@@ -148,21 +141,20 @@ jobs:
           echo "::add-mask::$APP_TOKEN"
           echo "app_token=$APP_TOKEN" >> "$GITHUB_OUTPUT"
 
-      # Bun runtime — needed by the action's TypeScript orchestrator
-      - name: Install Bun
-        uses: oven-sh/setup-bun@3d267786b128fe76c2f16a390aa2448b815359f3
-        with:
-          bun-version: latest
-
-      # Action's node_modules — `bun install` inside the action would need network
-      - name: Pre-install action dependencies
-        id: setup-deps
+      # Post a tracking comment immediately so the user sees the job link
+      - name: Post tracking comment
+        id: tracking-comment
         run: |
-          cd "/home/runner/work/_actions/anthropics/claude-code-action/b433f16b30d54063fd3bab6b12f46f3da00e41b6"
-          bun install --production
-          echo "bun_path=$(which bun)" >> "$GITHUB_OUTPUT"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ISSUE_NUMBER="${{ github.event.issue.number || github.event.pull_request.number }}"
+          BODY="**Claude is working on @${{ github.actor }}'s request...** — [View run]($RUN_URL)"
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/comments" \
+            -X POST -f body="$BODY" --jq '.id')
+          echo "comment_id=$COMMENT_ID" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
 
-      # Claude Code CLI via npm — native binary ignores HTTP_PROXY (anthropics/claude-code#14165)
+      # Claude Code CLI — native binary, no bun required
       - name: Install Claude Code (npm)
         id: setup-claude
         run: |
@@ -226,32 +218,57 @@ jobs:
           fi
 
       # ── Phase 4: Run Claude Code (sandboxed) ───────────────────────────
+      #
+      # Runs claude directly (no action wrapper) to avoid MCP server processes
+      # that block on stdin and keep the job alive after Claude finishes.
+      # See: https://github.com/anthropics/claude-code-action/issues/865
 
       - name: Run Claude Code
         id: run-claude
-        uses: anthropics/claude-code-action@b433f16b30d54063fd3bab6b12f46f3da00e41b6 # 2026-02-10
+        run: |
+          # Install plugins from local marketplace (no network needed)
+          claude plugin marketplace add /tmp/skill-issue
+          claude plugin install personal-skills@eni-skills
+          claude plugin install base-config@eni-skills
+
+          # Extract prompt: everything after "@claude" in the comment
+          PROMPT=$(echo "$COMMENT_BODY" | sed 's/.*@claude[[:space:]]*//')
+
+          claude -p "$PROMPT" \
+            --model opus \
+            --dangerously-skip-permissions \
+            --system-prompt "$CUSTOM_SYSTEM_PROMPT"
         env:
+          GITHUB_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
+          GH_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
           HTTP_PROXY: http://localhost:3128
           HTTPS_PROXY: http://localhost:3128
           NO_PROXY: localhost,127.0.0.1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ steps.oidc-exchange.outputs.app_token }}
-          path_to_bun_executable: ${{ steps.setup-deps.outputs.bun_path }}
-          path_to_claude_code_executable: ${{ steps.setup-claude.outputs.path }}
-          plugin_marketplaces: "/tmp/skill-issue"
-          plugins: |
-            personal-skills@eni-skills
-            base-config@eni-skills
-          prompt: ""
-          claude_args: |
-            --model opus
-            --dangerously-skip-permissions
-            --system-prompt "${{ env.CUSTOM_SYSTEM_PROMPT }}"
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       # ── Cleanup ────────────────────────────────────────────────────────
 
-      # The action skips token revocation when github_token is provided — do it ourselves
+      - name: Update tracking comment
+        if: always() && steps.tracking-comment.outputs.comment_id != ''
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "${{ steps.run-claude.outcome }}" = "success" ]; then
+            BODY="**Claude finished @${{ github.actor }}'s task** — [View run]($RUN_URL)"
+          else
+            BODY="**Run finished with status: ${{ steps.run-claude.outcome }}** — [View run]($RUN_URL)"
+          fi
+          PAYLOAD=$(jq -n --arg body "$BODY" '{body: $body}')
+          curl -sS -o /dev/null -w '%{http_code}\n' \
+            -x http://localhost:3128 \
+            -X PATCH \
+            -H "Authorization: Bearer $APP_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ steps.tracking-comment.outputs.comment_id }}"
+        env:
+          APP_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
+
       - name: Revoke GitHub App token
         if: always() && steps.oidc-exchange.outputs.app_token != ''
         run: |
