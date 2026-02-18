@@ -21,8 +21,6 @@ on:
     types: [created]
   pull_request_review_comment:
     types: [created]
-  pull_request:
-    types: [opened, synchronize]
 
 permissions: {}
 
@@ -42,7 +40,6 @@ jobs:
     steps:
 
       # ── Phase 1: Setup (full network) ──────────────────────────────────
-
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
@@ -173,7 +170,6 @@ jobs:
           echo "path=$(which claude)" >> "$GITHUB_OUTPUT"
 
       # ── Phase 3: Network sandbox ───────────────────────────────────────
-
       - name: Start Squid proxy
         run: |
           docker run -d --name sandbox-proxy -p 3128:3128 \
@@ -200,13 +196,26 @@ jobs:
         run: |
           RUNNER_UID=$(id -u)
 
-          # Allow established connections, loopback, and Docker bridge
+          # Resolve Squid container's IP dynamically to avoid allowing the entire 172.16/12 range
+          SQUID_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' sandbox-proxy)
+          if [ -z "$SQUID_IP" ]; then
+            echo "::error::Could not determine Squid container IP"; exit 1
+          fi
+          echo "Squid IP: $SQUID_IP"
+
+          # Allow established connections and loopback (covers local DNS via 127.0.0.53)
           sudo iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
           sudo iptables -A OUTPUT -o lo -j ACCEPT
-          sudo iptables -A OUTPUT -d 172.16.0.0/12 -j ACCEPT
+
+          # Allow traffic to Squid container only (single host, port 3128)
+          sudo iptables -A OUTPUT -d "$SQUID_IP" -p tcp --dport 3128 -j ACCEPT
 
           # Block new outbound TCP from runner UID — forces proxy use
           sudo iptables -A OUTPUT -m owner --uid-owner "$RUNNER_UID" -p tcp --syn -j REJECT --reject-with tcp-reset
+
+          # Block UDP and ICMP from runner UID — prevents DNS tunneling and ICMP exfiltration
+          sudo iptables -A OUTPUT -m owner --uid-owner "$RUNNER_UID" -p udp -j DROP
+          sudo iptables -A OUTPUT -m owner --uid-owner "$RUNNER_UID" -p icmp -j DROP
 
           # Verify: direct blocked, proxy works
           if curl -sf --max-time 5 -o /dev/null https://google.com 2>/dev/null; then
@@ -246,9 +255,12 @@ jobs:
       - name: Revoke GitHub App token
         if: always() && steps.oidc-exchange.outputs.app_token != ''
         run: |
-          curl -sf -X DELETE \
+          HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' -x "$HTTPS_PROXY" -X DELETE \
             -H "Authorization: Bearer $APP_TOKEN" \
-            "${GITHUB_API_URL:-https://api.github.com}/installation/token" \
-            || true
+            "https://api.github.com/installation/token")
+          if [ "$HTTP_STATUS" -ne 204 ]; then
+            echo "::warning::Token revocation failed (HTTP $HTTP_STATUS)"
+          fi
         env:
           APP_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
+          HTTPS_PROXY: http://localhost:3128
