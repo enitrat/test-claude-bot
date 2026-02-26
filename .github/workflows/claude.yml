@@ -27,6 +27,7 @@ jobs:
       contains(github.event.comment.body, '@claude') &&
       (github.event.issue.pull_request || github.event_name == 'pull_request_review_comment')
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read        # Checkout repository code and read files
       pull-requests: write  # Post review comments and update PR status
@@ -161,6 +162,8 @@ jobs:
       - name: Lock down iptables
         run: |
           RUNNER_UID=$(id -u)
+          # Save current firewall rules so they can be restored during always-run cleanup.
+          sudo iptables-save > /tmp/iptables-pre-claude.rules
 
           # Resolve Squid container's IP dynamically to avoid allowing the entire 172.16/12 range
           SQUID_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' sandbox-proxy)
@@ -208,7 +211,7 @@ jobs:
           # Extract prompt: everything after "@claude" in the comment
           PROMPT=$(echo "$COMMENT_BODY" | sed 's/.*@claude[[:space:]]*//')
 
-          claude -p "$PROMPT" \
+          timeout --signal=TERM --kill-after=30s 45m claude -p "$PROMPT" \
             --model opus \
             --dangerously-skip-permissions \
             --verbose \
@@ -248,6 +251,15 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
           HTTPS_PROXY: http://localhost:3128
+
+      - name: Restore iptables
+        if: always()
+        run: |
+          if [ -f /tmp/iptables-pre-claude.rules ]; then
+            sudo iptables-restore < /tmp/iptables-pre-claude.rules || echo "::warning::Failed to restore iptables"
+          else
+            echo "::warning::No iptables backup found at /tmp/iptables-pre-claude.rules"
+          fi
 
       - name: Stop Squid proxy
         if: always()
