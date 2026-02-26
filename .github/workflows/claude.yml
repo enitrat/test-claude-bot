@@ -33,7 +33,6 @@ jobs:
       pull-requests: write  # Post review comments and update PR status
       issues: write         # Respond to @claude mentions in issue comments
       id-token: write       # OIDC token for GitHub App token exchange
-      actions: read         # Read workflow run context for action inputs
     steps:
 
       # ── Phase 1: Setup (full network) ──────────────────────────────────
@@ -55,7 +54,7 @@ jobs:
           if [[ -n "$ISSUE_PR_URL" ]]; then
             # Comment is on a PR — fetch metadata via gh CLI
             PR_NUMBER="$ISSUE_NUMBER_INPUT"
-            PR_DATA=$(gh pr view "$PR_NUMBER" --json title,author,headRefName,baseRefName,state,additions,deletions,commits)
+            PR_DATA=$(gh pr view "$PR_NUMBER" --json title,author,headRefName,baseRefName,state,additions,deletions,commits,files)
             PR_TITLE=$(echo "$PR_DATA" | jq -r '.title')
             PR_AUTHOR=$(echo "$PR_DATA" | jq -r '.author.login')
             PR_HEAD=$(echo "$PR_DATA" | jq -r '.headRefName')
@@ -64,7 +63,7 @@ jobs:
             PR_ADDITIONS=$(echo "$PR_DATA" | jq -r '.additions')
             PR_DELETIONS=$(echo "$PR_DATA" | jq -r '.deletions')
             PR_COMMITS=$(echo "$PR_DATA" | jq -r '.commits | length')
-            PR_FILES=$(gh pr view "$PR_NUMBER" --json files | jq '.files | length')
+            PR_FILES=$(echo "$PR_DATA" | jq '.files | length')
 
             FORMATTED_CONTEXT="PR Title: ${PR_TITLE}
           PR Author: ${PR_AUTHOR}
@@ -138,7 +137,6 @@ jobs:
       # ── Phase 3: Network sandbox ───────────────────────────────────────
 
       - name: Cache Squid Docker image
-        id: squid-cache
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           path: /tmp/squid-image.tar
