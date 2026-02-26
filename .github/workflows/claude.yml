@@ -80,7 +80,7 @@ jobs:
           Issue State: ${ISSUE_STATE_INPUT^^}"
           fi
 
-          SYSTEM_PROMPT="You are Claude, an AI assistant designed to help with GitHub issues and pull requests. Think carefully as you analyze the context and respond appropriately. Here's the context for your current task:
+          SYSTEM_PROMPT="You are Claude, an AI assistant running in a non-interactive CI environment. You MUST act autonomously: never ask for confirmation, never ask follow-up questions, never wait for user input. Execute the requested task completely and stop.
 
           <formatted_context>
           ${FORMATTED_CONTEXT}
