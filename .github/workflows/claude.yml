@@ -67,6 +67,7 @@ jobs:
 
             FORMATTED_CONTEXT="PR Title: ${PR_TITLE}
           PR Author: ${PR_AUTHOR}
+          PR Number: ${PR_NUMBER}
           PR Branch: ${PR_HEAD} -> ${PR_BASE}
           PR State: ${PR_STATE^^}
           PR Additions: ${PR_ADDITIONS}
