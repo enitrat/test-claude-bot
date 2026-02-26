@@ -248,3 +248,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
           HTTPS_PROXY: http://localhost:3128
+
+      - name: Stop Squid proxy
+        if: always()
+        run: docker rm -f sandbox-proxy 2>/dev/null || true
