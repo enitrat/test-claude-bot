@@ -120,7 +120,6 @@ jobs:
           echo "::add-mask::$APP_TOKEN"
           echo "app_token=$APP_TOKEN" >> "$GITHUB_OUTPUT"
 
-      # Post a tracking comment immediately so the user sees the job link
       - name: Post tracking comment
         id: tracking-comment
         run: |
@@ -137,6 +136,23 @@ jobs:
         run: npm install -g @anthropic-ai/claude-code@2.1.42
 
       # ── Phase 3: Network sandbox ───────────────────────────────────────
+
+      - name: Cache Squid Docker image
+        id: squid-cache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: /tmp/squid-image.tar
+          key: squid-image-ubuntu-squid-latest
+
+      - name: Load or pull Squid image
+        run: |
+          if [ -f /tmp/squid-image.tar ]; then
+            docker load < /tmp/squid-image.tar
+          else
+            docker pull ubuntu/squid
+            docker save ubuntu/squid > /tmp/squid-image.tar
+          fi
+
       - name: Start Squid proxy
         run: |
           docker run -d --name sandbox-proxy -p 3128:3128 \
@@ -211,7 +227,7 @@ jobs:
           # Extract prompt: everything after "@claude" in the comment
           PROMPT=$(echo "$COMMENT_BODY" | sed 's/.*@claude[[:space:]]*//')
 
-          timeout --signal=TERM --kill-after=30s 45m claude -p "$PROMPT" \
+          claude -p "$PROMPT" \
             --model opus \
             --dangerously-skip-permissions \
             --verbose \
