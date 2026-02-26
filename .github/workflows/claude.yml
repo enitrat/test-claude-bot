@@ -6,7 +6,7 @@ name: claude-review
 # Security model:
 #   - Only write/admin users can trigger (enforced by permission check on the App token)
 #   - Network sandbox: Squid proxy (L7 domain allowlist) + iptables (L3 egress block)
-#   - All dependencies pre-installed before lockdown
+#   - Claude CLI pre-installed before network lockdown
 #
 # Secrets:
 #   - CLAUDE_CODE_OAUTH_TOKEN: Anthropic API auth (from `claude setup-token`)
@@ -22,7 +22,7 @@ permissions: {}
 
 jobs:
   claude-review:
-    name: claude-review/respond
+    name: claude-review
     if: |
       contains(github.event.comment.body, '@claude') &&
       (github.event.issue.pull_request || github.event_name == 'pull_request_review_comment')
@@ -41,7 +41,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Install uv
+      - name: Install uv # Required by internal skill scripts
         uses: astral-sh/setup-uv@61cb8a9741eeb8a550a1b8544337180c0fc8476b
 
       - name: Clone private repositories
@@ -50,32 +50,20 @@ jobs:
           GH_TOKEN: ${{ secrets.CLAUDE_ACCESS_TOKEN }}
 
       - name: Build custom system prompt
-        id: custom_prompt
         run: |
-          if [[ "$EVENT_NAME" == "pull_request" ]] || [[ -n "$ISSUE_PR_URL" ]]; then
-            if [[ "$EVENT_NAME" == "pull_request" ]]; then
-              PR_TITLE="$PR_TITLE_INPUT"
-              PR_AUTHOR="$PR_AUTHOR_INPUT"
-              PR_HEAD="$PR_HEAD_INPUT"
-              PR_BASE="$PR_BASE_INPUT"
-              PR_STATE="$PR_STATE_INPUT"
-              PR_ADDITIONS="$PR_ADDITIONS_INPUT"
-              PR_DELETIONS="$PR_DELETIONS_INPUT"
-              PR_COMMITS="$PR_COMMITS_INPUT"
-              PR_FILES="$PR_FILES_INPUT"
-            else
-              PR_NUMBER="$ISSUE_NUMBER_INPUT"
-              PR_DATA=$(gh pr view "$PR_NUMBER" --json title,author,headRefName,baseRefName,state,additions,deletions,commits)
-              PR_TITLE=$(echo "$PR_DATA" | jq -r '.title')
-              PR_AUTHOR=$(echo "$PR_DATA" | jq -r '.author.login')
-              PR_HEAD=$(echo "$PR_DATA" | jq -r '.headRefName')
-              PR_BASE=$(echo "$PR_DATA" | jq -r '.baseRefName')
-              PR_STATE=$(echo "$PR_DATA" | jq -r '.state')
-              PR_ADDITIONS=$(echo "$PR_DATA" | jq -r '.additions')
-              PR_DELETIONS=$(echo "$PR_DATA" | jq -r '.deletions')
-              PR_COMMITS=$(echo "$PR_DATA" | jq -r '.commits | length')
-              PR_FILES=$(gh pr view "$PR_NUMBER" --json files | jq '.files | length')
-            fi
+          if [[ -n "$ISSUE_PR_URL" ]]; then
+            # Comment is on a PR — fetch metadata via gh CLI
+            PR_NUMBER="$ISSUE_NUMBER_INPUT"
+            PR_DATA=$(gh pr view "$PR_NUMBER" --json title,author,headRefName,baseRefName,state,additions,deletions,commits)
+            PR_TITLE=$(echo "$PR_DATA" | jq -r '.title')
+            PR_AUTHOR=$(echo "$PR_DATA" | jq -r '.author.login')
+            PR_HEAD=$(echo "$PR_DATA" | jq -r '.headRefName')
+            PR_BASE=$(echo "$PR_DATA" | jq -r '.baseRefName')
+            PR_STATE=$(echo "$PR_DATA" | jq -r '.state')
+            PR_ADDITIONS=$(echo "$PR_DATA" | jq -r '.additions')
+            PR_DELETIONS=$(echo "$PR_DATA" | jq -r '.deletions')
+            PR_COMMITS=$(echo "$PR_DATA" | jq -r '.commits | length')
+            PR_FILES=$(gh pr view "$PR_NUMBER" --json files | jq '.files | length')
 
             FORMATTED_CONTEXT="PR Title: ${PR_TITLE}
           PR Author: ${PR_AUTHOR}
@@ -86,6 +74,7 @@ jobs:
           Total Commits: ${PR_COMMITS}
           Changed Files: ${PR_FILES} files"
           else
+            # Comment is on an issue
             FORMATTED_CONTEXT="Issue Title: ${ISSUE_TITLE_INPUT}
           Issue Author: ${ISSUE_AUTHOR_INPUT}
           Issue State: ${ISSUE_STATE_INPUT^^}"
@@ -104,25 +93,14 @@ jobs:
           } >> "$GITHUB_ENV"
         env:
           GH_TOKEN: ${{ secrets.CLAUDE_ACCESS_TOKEN }}
-          EVENT_NAME: ${{ github.event_name }}
           ISSUE_PR_URL: ${{ github.event.issue.pull_request.url || '' }}
-          PR_TITLE_INPUT: ${{ github.event.pull_request.title }}
-          PR_AUTHOR_INPUT: ${{ github.event.pull_request.user.login }}
-          PR_HEAD_INPUT: ${{ github.event.pull_request.head.ref }}
-          PR_BASE_INPUT: ${{ github.event.pull_request.base.ref }}
-          PR_STATE_INPUT: ${{ github.event.pull_request.state }}
-          PR_ADDITIONS_INPUT: ${{ github.event.pull_request.additions }}
-          PR_DELETIONS_INPUT: ${{ github.event.pull_request.deletions }}
-          PR_COMMITS_INPUT: ${{ github.event.pull_request.commits }}
-          PR_FILES_INPUT: ${{ github.event.pull_request.changed_files }}
           ISSUE_NUMBER_INPUT: ${{ github.event.issue.number }}
           ISSUE_TITLE_INPUT: ${{ github.event.issue.title }}
           ISSUE_AUTHOR_INPUT: ${{ github.event.issue.user.login }}
           ISSUE_STATE_INPUT: ${{ github.event.issue.state }}
 
-      # ── Phase 2: Pre-install dependencies (before lockdown) ────────────
+      # ── Phase 2: Authenticate & install CLI (before lockdown) ──────────
 
-      # OIDC → Anthropic exchange → GitHub App token
       - name: Exchange OIDC for GitHub App token
         id: oidc-exchange
         run: |
@@ -154,12 +132,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
 
-      # Claude Code CLI — native binary, no bun required
-      - name: Install Claude Code (npm)
-        id: setup-claude
-        run: |
-          npm install -g @anthropic-ai/claude-code@2.1.42
-          echo "path=$(which claude)" >> "$GITHUB_OUTPUT"
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code@2.1.42
 
       # ── Phase 3: Network sandbox ───────────────────────────────────────
       - name: Start Squid proxy
@@ -237,6 +211,7 @@ jobs:
           claude -p "$PROMPT" \
             --model opus \
             --dangerously-skip-permissions \
+            --verbose \
             --system-prompt "$CUSTOM_SYSTEM_PROMPT"
         env:
           GITHUB_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
@@ -258,26 +233,18 @@ jobs:
           else
             BODY="**Run finished with status: ${{ steps.run-claude.outcome }}** — [View run]($RUN_URL)"
           fi
-          PAYLOAD=$(jq -n --arg body "$BODY" '{body: $body}')
-          curl -sS -o /dev/null -w '%{http_code}\n' \
-            -x http://localhost:3128 \
-            -X PATCH \
-            -H "Authorization: Bearer $APP_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD" \
-            "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ steps.tracking-comment.outputs.comment_id }}"
+          gh api "repos/${{ github.repository }}/issues/comments/${{ steps.tracking-comment.outputs.comment_id }}" \
+            -X PATCH -f body="$BODY"
         env:
-          APP_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
+          GH_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
+          HTTPS_PROXY: http://localhost:3128
 
       - name: Revoke GitHub App token
         if: always() && steps.oidc-exchange.outputs.app_token != ''
         run: |
-          HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' -x "$HTTPS_PROXY" -X DELETE \
-            -H "Authorization: Bearer $APP_TOKEN" \
-            "https://api.github.com/installation/token")
-          if [ "$HTTP_STATUS" -ne 204 ]; then
-            echo "::warning::Token revocation failed (HTTP $HTTP_STATUS)"
+          if ! gh api "installation/token" -X DELETE --silent 2>/dev/null; then
+            echo "::warning::Token revocation failed"
           fi
         env:
-          APP_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
+          GH_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
           HTTPS_PROXY: http://localhost:3128
