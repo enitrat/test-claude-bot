@@ -49,38 +49,44 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.CLAUDE_ACCESS_TOKEN }}
 
-      - name: Build custom system prompt
+      - name: Fetch PR/issue metadata
         run: |
           if [[ -n "$ISSUE_PR_URL" ]]; then
-            # Comment is on a PR — fetch metadata via gh CLI
             PR_NUMBER="$ISSUE_NUMBER_INPUT"
             PR_DATA=$(gh pr view "$PR_NUMBER" --json title,author,headRefName,baseRefName,state,additions,deletions,commits,files)
-            PR_TITLE=$(echo "$PR_DATA" | jq -r '.title')
-            PR_AUTHOR=$(echo "$PR_DATA" | jq -r '.author.login')
-            PR_HEAD=$(echo "$PR_DATA" | jq -r '.headRefName')
-            PR_BASE=$(echo "$PR_DATA" | jq -r '.baseRefName')
-            PR_STATE=$(echo "$PR_DATA" | jq -r '.state')
-            PR_ADDITIONS=$(echo "$PR_DATA" | jq -r '.additions')
-            PR_DELETIONS=$(echo "$PR_DATA" | jq -r '.deletions')
-            PR_COMMITS=$(echo "$PR_DATA" | jq -r '.commits | length')
-            PR_FILES=$(echo "$PR_DATA" | jq '.files | length')
 
-            FORMATTED_CONTEXT="PR Title: ${PR_TITLE}
-          PR Author: ${PR_AUTHOR}
-          PR Number: ${PR_NUMBER}
-          PR Branch: ${PR_HEAD} -> ${PR_BASE}
-          PR State: ${PR_STATE^^}
-          PR Additions: ${PR_ADDITIONS}
-          PR Deletions: ${PR_DELETIONS}
-          Total Commits: ${PR_COMMITS}
-          Changed Files: ${PR_FILES} files"
+            {
+              echo "FORMATTED_CONTEXT<<EOF"
+              echo "PR Title: $(echo "$PR_DATA" | jq -r '.title')"
+              echo "PR Author: $(echo "$PR_DATA" | jq -r '.author.login')"
+              echo "PR Number: ${PR_NUMBER}"
+              echo "PR Branch: $(echo "$PR_DATA" | jq -r '.headRefName') -> $(echo "$PR_DATA" | jq -r '.baseRefName')"
+              echo "PR State: $(echo "$PR_DATA" | jq -r '.state | ascii_upcase')"
+              echo "PR Additions: $(echo "$PR_DATA" | jq -r '.additions')"
+              echo "PR Deletions: $(echo "$PR_DATA" | jq -r '.deletions')"
+              echo "Total Commits: $(echo "$PR_DATA" | jq -r '.commits | length')"
+              echo "Changed Files: $(echo "$PR_DATA" | jq '.files | length') files"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
           else
-            # Comment is on an issue
-            FORMATTED_CONTEXT="Issue Title: ${ISSUE_TITLE_INPUT}
-          Issue Author: ${ISSUE_AUTHOR_INPUT}
-          Issue State: ${ISSUE_STATE_INPUT^^}"
+            {
+              echo "FORMATTED_CONTEXT<<EOF"
+              echo "Issue Title: ${ISSUE_TITLE_INPUT}"
+              echo "Issue Author: ${ISSUE_AUTHOR_INPUT}"
+              echo "Issue State: ${ISSUE_STATE_INPUT^^}"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
           fi
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_ACCESS_TOKEN }}
+          ISSUE_PR_URL: ${{ github.event.issue.pull_request.url || '' }}
+          ISSUE_NUMBER_INPUT: ${{ github.event.issue.number }}
+          ISSUE_TITLE_INPUT: ${{ github.event.issue.title }}
+          ISSUE_AUTHOR_INPUT: ${{ github.event.issue.user.login }}
+          ISSUE_STATE_INPUT: ${{ github.event.issue.state }}
 
+      - name: Build custom system prompt
+        run: |
           SYSTEM_PROMPT="You are Claude, an AI assistant running in a non-interactive CI environment. You MUST act autonomously: never ask for confirmation, never ask follow-up questions, never wait for user input. Execute the requested task completely and stop.
 
           <formatted_context>
@@ -92,13 +98,6 @@ jobs:
             echo "$SYSTEM_PROMPT"
             echo "EOF"
           } >> "$GITHUB_ENV"
-        env:
-          GH_TOKEN: ${{ secrets.CLAUDE_ACCESS_TOKEN }}
-          ISSUE_PR_URL: ${{ github.event.issue.pull_request.url || '' }}
-          ISSUE_NUMBER_INPUT: ${{ github.event.issue.number }}
-          ISSUE_TITLE_INPUT: ${{ github.event.issue.title }}
-          ISSUE_AUTHOR_INPUT: ${{ github.event.issue.user.login }}
-          ISSUE_STATE_INPUT: ${{ github.event.issue.state }}
 
       # ── Phase 2: Authenticate & install CLI (before lockdown) ──────────
 
@@ -108,14 +107,18 @@ jobs:
           OIDC_TOKEN=$(curl -sf \
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=claude-code-github-action" | jq -r '.value')
-          [ -n "$OIDC_TOKEN" ] && [ "$OIDC_TOKEN" != "null" ] || { echo "::error::OIDC token request failed"; exit 1; }
+          if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+            echo "::error::OIDC token request failed"; exit 1
+          fi
 
           APP_TOKEN=$(curl -sf -X POST \
             -H "Authorization: Bearer $OIDC_TOKEN" \
             -H "Content-Type: application/json" \
             -d '{"permissions":{"contents":"write","pull_requests":"write","issues":"write"}}' \
             "https://api.anthropic.com/api/github/github-app-token-exchange" | jq -r '.token')
-          [ -n "$APP_TOKEN" ] && [ "$APP_TOKEN" != "null" ] || { echo "::error::Token exchange failed"; exit 1; }
+          if [ -z "$APP_TOKEN" ] || [ "$APP_TOKEN" = "null" ]; then
+            echo "::error::Token exchange failed"; exit 1
+          fi
 
           echo "::add-mask::$APP_TOKEN"
           echo "app_token=$APP_TOKEN" >> "$GITHUB_OUTPUT"
@@ -125,12 +128,13 @@ jobs:
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           ISSUE_NUMBER="${{ github.event.issue.number || github.event.pull_request.number }}"
-          BODY="**Claude is working on @${{ github.actor }}'s request...** — [View run]($RUN_URL)"
+          BODY="**Claude is working on @${ACTOR}'s request...** — [View run]($RUN_URL)"
           COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/comments" \
             -X POST -f body="$BODY" --jq '.id')
           echo "comment_id=$COMMENT_ID" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
+          ACTOR: ${{ github.actor }}
 
       - name: Install Claude Code CLI
         run: npm install -g @anthropic-ai/claude-code@2.1.42
@@ -178,7 +182,7 @@ jobs:
         run: |
           RUNNER_UID=$(id -u)
           # Save current firewall rules so they can be restored during always-run cleanup.
-          sudo iptables-save > /tmp/iptables-pre-claude.rules
+          sudo iptables-save | tee /tmp/iptables-pre-claude.rules > /dev/null
 
           # Resolve Squid container's IP dynamically to avoid allowing the entire 172.16/12 range
           SQUID_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' sandbox-proxy)
@@ -224,7 +228,7 @@ jobs:
           claude plugin install base-config@eni-skills
 
           # Extract prompt: everything after "@claude" in the comment
-          PROMPT=$(echo "$COMMENT_BODY" | sed 's/.*@claude[[:space:]]*//')
+          PROMPT=${COMMENT_BODY#*@claude }
 
           claude -p "$PROMPT" \
             --model opus \
@@ -246,23 +250,25 @@ jobs:
         if: always() && steps.tracking-comment.outputs.comment_id != ''
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          if [ "${{ steps.run-claude.outcome }}" = "success" ]; then
-            BODY="**Claude finished @${{ github.actor }}'s task** — [View run]($RUN_URL)"
+          if [ "$CLAUDE_OUTCOME" = "success" ]; then
+            BODY="**Claude finished @${ACTOR}'s task** — [View run]($RUN_URL)"
           else
-            BODY="**Run finished with status: ${{ steps.run-claude.outcome }}** — [View run]($RUN_URL)"
+            BODY="**Run finished with status: ${CLAUDE_OUTCOME}** — [View run]($RUN_URL)"
           fi
           gh api "repos/${{ github.repository }}/issues/comments/${{ steps.tracking-comment.outputs.comment_id }}" \
             -X PATCH -f body="$BODY"
         env:
           GH_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
           HTTPS_PROXY: http://localhost:3128
+          ACTOR: ${{ github.actor }}
+          CLAUDE_OUTCOME: ${{ steps.run-claude.outcome }}
 
       - name: Revoke GitHub App token
         if: always() && steps.oidc-exchange.outputs.app_token != ''
         run: |
-          if ! gh api "installation/token" -X DELETE --silent 2>/dev/null; then
+          gh api "installation/token" -X DELETE || {
             echo "::warning::Token revocation failed"
-          fi
+          }
         env:
           GH_TOKEN: ${{ steps.oidc-exchange.outputs.app_token }}
           HTTPS_PROXY: http://localhost:3128
@@ -271,7 +277,7 @@ jobs:
         if: always()
         run: |
           if [ -f /tmp/iptables-pre-claude.rules ]; then
-            sudo iptables-restore < /tmp/iptables-pre-claude.rules || echo "::warning::Failed to restore iptables"
+            sudo sh -c 'iptables-restore < /tmp/iptables-pre-claude.rules' || echo "::warning::Failed to restore iptables"
           else
             echo "::warning::No iptables backup found at /tmp/iptables-pre-claude.rules"
           fi
